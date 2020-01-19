@@ -54,7 +54,7 @@
 Name:          tomcat
 Epoch:         0
 Version:       %{major_version}.%{minor_version}.%{micro_version}
-Release:       8%{?dist}
+Release:       9%{?dist}
 Summary:       Apache Servlet/JSP Engine, RI for Servlet %{servletspec}/JSP %{jspspec} API
 
 Group:         System Environment/Daemons
@@ -94,6 +94,13 @@ Patch6: %{name}-7.0.76-CVE-2017-7674.patch
 Patch7: %{name}-7.0.76-CVE-2017-12617.patch
 Patch8: patch.rhbz1602060
 Patch9: %{name}-7.0.76-CVE-2018-1336.patch
+Patch10: %{name}-7.0.76-CVE-2018-11784.patch
+Patch11: %{name}-7.0.76-CVE-2018-1304.patch
+Patch12: %{name}-7.0.76-CVE-2018-1305.patch
+Patch13: %{name}-7.0.76-CVE-2018-8014.patch
+Patch14: %{name}-7.0.76-CVE-2018-8034.patch
+Patch15: %{name}-7.0.76-rhbz-1588703.patch
+Patch16: %{name}-7.0.76-rhbz-1455483.patch
 
 BuildArch:     noarch
 
@@ -248,6 +255,13 @@ find . -type f \( -name "*.bat" -o -name "*.class" -o -name Thumbs.db -o -name "
 %patch7 -p0
 %patch8 -p0
 %patch9 -p0
+%patch10 -p0
+%patch11 -p0
+%patch12 -p0
+%patch13 -p0
+%patch14 -p0
+%patch15 -p0
+%patch16 -p0
 
 %{__ln_s} $(build-classpath jakarta-taglibs-core) webapps/examples/WEB-INF/lib/jstl.jar
 %{__ln_s} $(build-classpath jakarta-taglibs-standard) webapps/examples/WEB-INF/lib/standard.jar
@@ -692,11 +706,21 @@ fi
 %attr(0644,root,root) %{_unitdir}/%{name}-jsvc.service
 
 %changelog
-* Mon Oct 01 2018 Coty Sutherland <csutherl@redhat.com> 0:7.0.76-8
-- Resolves: rhbz#1608608 CVE-2018-1336 tomcat: A bug in the UTF 8 decoder can lead to DoS
+* Tue Feb 12 2019 Coty Sutherland <csutherl@redhat.com> 0:7.0.76-9
+- Resolves: rhbz#1641873 CVE-2018-11784 tomcat: Open redirect in default servlet
+- Resolves: rhbz#1552375 CVE-2018-1304 tomcat: Incorrect handling of empty string URL in security constraints can lead to unintended exposure of resources
+- Resolves: rhbz#1552374 CVE-2018-1305 tomcat: Late application of security constraints can lead to resource exposure for unauthorised users
+- Resolves: rhbz#1590182 CVE-2018-8014 tomcat: Insecure defaults in CORS filter enable 'supportsCredentials' for all origins
+- Resolves: rhbz#1608609 CVE-2018-8034 tomcat: host name verification missing in WebSocket client
+- Resolves: rhbz#1588703 Backport of Negative maxCookieCount value causes exception for Tomcat
+- Resolves: rhbz#1472950 shutdown_wait option is not working for Tomcat
+- Resolves: rhbz#1455483 Add support for characters "<" and ">" to the possible whitelist values
 
-* Wed Jul 18 2018 Jean-Frederic Clere <jclere@redhat.com> 0:7.0.76-7
-- Resolves: rhbz#1607893 Deadlock occurs while sending to a closing session.
+* Fri Oct 12 2018 Coty Sutherland <csutherl@redhat.com> 0:7.0.76-8
+- Resolves: rhbz#1608607 CVE-2018-1336 tomcat: A bug in the UTF 8 decoder can lead to DoS
+
+* Tue Jul 24 2018 Jean-Frederic Clere <jclere@redhat.com> 0:7.0.76-7
+- Resolves: rhbz#1602060 Deadlock occurs while sending to a closing session
 
 * Wed Nov 08 2017 Coty Sutherland <csutherl@redhat.com> 0:7.0.76-6
 - Related: rhbz#1505762 Remove erroneous useradd

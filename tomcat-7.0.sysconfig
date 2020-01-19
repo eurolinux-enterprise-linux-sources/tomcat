@@ -29,23 +29,14 @@
 # Use JAVA_OPTS to set java.library.path for libtcnative.so
 #JAVA_OPTS="-Djava.library.path=@@@LIBDIR@@@"
 
-# What user should run tomcat
-#TOMCAT_USER="tomcat"
-
 # You can change your tomcat locale here
 #LANG="en_US"
 
 # Run tomcat under the Java Security Manager
 #SECURITY_MANAGER="false"
 
-# Time to wait in seconds, before killing process
-#SHUTDOWN_WAIT="30"
-
-# Whether to annoy the user with "attempting to shut down" messages or not
-#SHUTDOWN_VERBOSE="false"
-
-# Connector port is 8080 for this tomcat instance
-#CONNECTOR_PORT="8080"
+# SHUTDOWN_WAIT has been deprecated. To change the shutdown wait time, set
+# TimeoutStopSec in tomcat.service.
 
 # If you wish to further customize your tomcat environment,
 # put your own definitions here
