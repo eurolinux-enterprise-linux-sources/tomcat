@@ -54,7 +54,7 @@
 Name:          tomcat
 Epoch:         0
 Version:       %{major_version}.%{minor_version}.%{micro_version}
-Release:       7%{?dist}
+Release:       8%{?dist}
 Summary:       Apache Servlet/JSP Engine, RI for Servlet %{servletspec}/JSP %{jspspec} API
 
 Group:         System Environment/Daemons
@@ -93,6 +93,7 @@ Patch5: %{name}-7.0.76-CVE-2017-5647.patch
 Patch6: %{name}-7.0.76-CVE-2017-7674.patch
 Patch7: %{name}-7.0.76-CVE-2017-12617.patch
 Patch8: patch.rhbz1602060
+Patch9: %{name}-7.0.76-CVE-2018-1336.patch
 
 BuildArch:     noarch
 
@@ -246,6 +247,7 @@ find . -type f \( -name "*.bat" -o -name "*.class" -o -name Thumbs.db -o -name "
 %patch6 -p0
 %patch7 -p0
 %patch8 -p0
+%patch9 -p0
 
 %{__ln_s} $(build-classpath jakarta-taglibs-core) webapps/examples/WEB-INF/lib/jstl.jar
 %{__ln_s} $(build-classpath jakarta-taglibs-standard) webapps/examples/WEB-INF/lib/standard.jar
@@ -690,6 +692,9 @@ fi
 %attr(0644,root,root) %{_unitdir}/%{name}-jsvc.service
 
 %changelog
+* Mon Oct 01 2018 Coty Sutherland <csutherl@redhat.com> 0:7.0.76-8
+- Resolves: rhbz#1608608 CVE-2018-1336 tomcat: A bug in the UTF 8 decoder can lead to DoS
+
 * Wed Jul 18 2018 Jean-Frederic Clere <jclere@redhat.com> 0:7.0.76-7
 - Resolves: rhbz#1607893 Deadlock occurs while sending to a closing session.
 
