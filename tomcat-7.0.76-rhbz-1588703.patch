@@ -1,0 +1,39 @@
+commit 7f474ba097347fbe4c3db776b46eef59a587c0aa
+Author: Coty Sutherland <csutherl@apache.org>
+Date:   Tue Sep 19 14:22:06 2017 +0000
+
+    Update fix for bug 59904 so that values less than zero are accepted instead of throwing a NegativeArraySizeException.
+    
+    git-svn-id: https://svn.apache.org/repos/asf/tomcat/tc7.0.x/trunk@1808887 13f79535-47bb-0310-9956-ffa450edef68
+
+diff --git a/java/org/apache/tomcat/util/http/Cookies.java b/java/org/apache/tomcat/util/http/Cookies.java
+index 5ae71ec97c..511bbf3243 100644
+--- java/org/apache/tomcat/util/http/Cookies.java
++++ java/org/apache/tomcat/util/http/Cookies.java
+@@ -134,7 +134,7 @@ public final class Cookies {
+         }
+ 
+         if (cookieCount >= scookies.length) {
+-            int newSize = Math.min(2*cookieCount, limit);
++            int newSize = limit > -1 ? Math.min(2*cookieCount, limit) : 2*cookieCount;
+             ServerCookie scookiesTmp[] = new ServerCookie[newSize];
+             System.arraycopy( scookies, 0, scookiesTmp, 0, cookieCount);
+             scookies=scookiesTmp;
+diff -up webapps/docs/changelog.xml.orig webapps/docs/changelog.xml
+--- webapps/docs/changelog.xml.orig	2019-03-01 13:04:17.093997197 -0500
++++ webapps/docs/changelog.xml	2019-03-01 13:05:04.168868394 -0500
+@@ -92,6 +92,14 @@
+       </fix>
+     </changelog>
+   </subsection>
++  <subsection name="Other">
++    <changelog>
++      <fix> 
++        Update fix for <bug>59904</bug> so that values less than zero are accepted
++        instead of throwing a NegativeArraySizeException. (remm)
++      </fix>
++    </changelog>
++  </subsection>
+ </section>
+ <section name="Tomcat 7.0.76-8 (csutherl)">
+   <subsection name="Catalina">

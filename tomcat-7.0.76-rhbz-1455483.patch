@@ -1,0 +1,828 @@
+diff -up java/org/apache/coyote/http11/AbstractHttp11Processor.java.orig java/org/apache/coyote/http11/AbstractHttp11Processor.java
+--- java/org/apache/coyote/http11/AbstractHttp11Processor.java.orig	2017-03-09 08:51:40.000000000 -0500
++++ java/org/apache/coyote/http11/AbstractHttp11Processor.java	2019-03-05 14:58:20.285295932 -0500
+@@ -48,6 +48,7 @@ import org.apache.tomcat.util.buf.HexUti
+ import org.apache.tomcat.util.buf.MessageBytes;
+ import org.apache.tomcat.util.http.FastHttpDateFormat;
+ import org.apache.tomcat.util.http.MimeHeaders;
++import org.apache.tomcat.util.http.parser.HttpParser;
+ import org.apache.tomcat.util.log.UserDataHelper;
+ import org.apache.tomcat.util.net.AbstractEndpoint;
+ import org.apache.tomcat.util.net.AbstractEndpoint.Handler.SocketState;
+@@ -262,6 +263,9 @@ public abstract class AbstractHttp11Proc
+     protected org.apache.coyote.http11.upgrade.UpgradeInbound upgradeInbound = null;
+ 
+ 
++    protected HttpParser httpParser;
++
++
+     /**
+      * Instance of the new protocol to use after the HTTP connection has been
+      * upgraded using the Servlet 3.1 based upgrade process.
+@@ -1301,33 +1305,62 @@ public abstract class AbstractHttp11Proc
+             }
+         }
+ 
+-        // Check for a full URI (including protocol://host:port/)
++        // Check for an absolute-URI less the query string which has already
++        // been removed during the parsing of the request line
+         ByteChunk uriBC = request.requestURI().getByteChunk();
++        byte[] uriB = uriBC.getBytes();
+         if (uriBC.startsWithIgnoreCase("http", 0)) {
+ 
+-            int pos = uriBC.indexOf("://", 0, 3, 4);
+-            int uriBCStart = uriBC.getStart();
+-            int slashPos = -1;
+-            if (pos != -1) {
+-                byte[] uriB = uriBC.getBytes();
+-                slashPos = uriBC.indexOf('/', pos + 3);
++            int pos = 4;
++            // Check for https
++            if (uriBC.startsWithIgnoreCase("s", pos)) {
++                pos++;
++            }
++            // Next 3 characters must be "://"
++            if (uriBC.startsWith("://", pos)) {
++                int uriBCStart = uriBC.getStart();
++
++                // '/' does not appear in the authority so use the first
++                // instance to split the authority and the path segments
++                int slashPos = uriBC.indexOf('/', pos);
++                // '@' in the authority delimits the userinfo
++
+                 if (slashPos == -1) {
+                     slashPos = uriBC.getLength();
+-                    // Set URI as "/"
+-                    request.requestURI().setBytes
+-                        (uriB, uriBCStart + pos + 1, 1);
++                    // Set URI as "/". Use 6 as it will always be a '/'.
++                    // 01234567
++                    // http://
++                    // https://
++                    request.requestURI().setBytes(uriB, uriBCStart + 6, 1);
+                 } else {
+-                    request.requestURI().setBytes
+-                        (uriB, uriBCStart + slashPos,
+-                         uriBC.getLength() - slashPos);
++                    request.requestURI().setBytes(uriB, uriBCStart + slashPos, uriBC.getLength() - slashPos);
+                 }
+                 MessageBytes hostMB = headers.setValue("host");
+                 hostMB.setBytes(uriB, uriBCStart + pos + 3,
+                                 slashPos - pos - 3);
++            } else {
++                response.setStatus(400);
++                setErrorState(ErrorState.CLOSE_CLEAN, null);
++                if (getLog().isDebugEnabled()) {
++                    getLog().debug(sm.getString("http11processor.request.invalidScheme"));
++                }
+             }
+ 
+         }
+ 
++        // Validate the characters in the URI. %nn decoding will be checked at
++        // the point of decoding.
++        for (int i = uriBC.getStart(); i < uriBC.getEnd(); i++) {
++            if (!httpParser.isAbsolutePathRelaxed(uriB[i])) {
++                response.setStatus(400);
++                setErrorState(ErrorState.CLOSE_CLEAN, null);
++                if (getLog().isDebugEnabled()) {
++                    getLog().debug(sm.getString("http11processor.request.invalidUri"));
++                }
++                break;
++            }
++        }
++
+         // Input filter setup
+         InputFilter[] inputFilters = getInputBuffer().getFilters();
+ 
+@@ -1364,8 +1397,7 @@ public abstract class AbstractHttp11Proc
+                 headers.removeHeader("content-length");
+                 request.setContentLength(-1);
+             } else {
+-                getInputBuffer().addActiveFilter
+-                        (inputFilters[Constants.IDENTITY_FILTER]);
++                getInputBuffer().addActiveFilter(inputFilters[Constants.IDENTITY_FILTER]);
+                 contentDelimitation = true;
+             }
+         }
+@@ -1383,14 +1415,14 @@ public abstract class AbstractHttp11Proc
+             }
+         }
+ 
++        // Validate host name and extract port if present
+         parseHost(valueMB);
+ 
+         if (!contentDelimitation) {
+             // If there's no content length
+             // (broken HTTP/1.0 or HTTP/1.1), assume
+             // the client is not broken and didn't send a body
+-            getInputBuffer().addActiveFilter
+-                    (inputFilters[Constants.VOID_FILTER]);
++            getInputBuffer().addActiveFilter(inputFilters[Constants.VOID_FILTER]);
+             contentDelimitation = true;
+         }
+ 
+diff -up java/org/apache/coyote/http11/AbstractHttp11Protocol.java.orig java/org/apache/coyote/http11/AbstractHttp11Protocol.java
+--- java/org/apache/coyote/http11/AbstractHttp11Protocol.java.orig	2019-03-05 12:14:08.096279991 -0500
++++ java/org/apache/coyote/http11/AbstractHttp11Protocol.java	2019-03-05 14:03:32.186921274 -0500
+@@ -45,6 +45,23 @@ public abstract class AbstractHttp11Prot
+     // ------------------------------------------------ HTTP specific properties
+     // ------------------------------------------ managed in the ProtocolHandler
+ 
++    private String relaxedPathChars = null;
++    public String getRelaxedPathChars() {
++        return relaxedPathChars;
++    }
++    public void setRelaxedPathChars(String relaxedPathChars) {
++        this.relaxedPathChars = relaxedPathChars;
++    }
++
++
++    private String relaxedQueryChars = null;
++    public String getRelaxedQueryChars() {
++        return relaxedQueryChars;
++    }
++    public void setRelaxedQueryChars(String relaxedQueryChars) {
++        this.relaxedQueryChars = relaxedQueryChars;
++    }
++
+     private int socketBuffer = 9000;
+     public int getSocketBuffer() { return socketBuffer; }
+     public void setSocketBuffer(int socketBuffer) {
+diff -up java/org/apache/coyote/http11/AbstractInputBuffer.java.orig java/org/apache/coyote/http11/AbstractInputBuffer.java
+--- java/org/apache/coyote/http11/AbstractInputBuffer.java.orig	2017-03-09 08:51:40.000000000 -0500
++++ java/org/apache/coyote/http11/AbstractInputBuffer.java	2019-03-05 12:14:08.096279991 -0500
+@@ -22,6 +22,7 @@ import org.apache.coyote.InputBuffer;
+ import org.apache.coyote.Request;
+ import org.apache.tomcat.util.buf.ByteChunk;
+ import org.apache.tomcat.util.http.MimeHeaders;
++import org.apache.tomcat.util.http.parser.HttpParser;
+ import org.apache.tomcat.util.net.AbstractEndpoint;
+ import org.apache.tomcat.util.net.SocketWrapper;
+ import org.apache.tomcat.util.res.StringManager;
+@@ -108,6 +109,9 @@ public abstract class AbstractInputBuffe
+     protected int lastActiveFilter;
+ 
+ 
++    protected HttpParser httpParser;
++
++
+     // ------------------------------------------------------------- Properties
+ 
+ 
+diff -up java/org/apache/coyote/http11/Http11AprProcessor.java.orig java/org/apache/coyote/http11/Http11AprProcessor.java
+--- java/org/apache/coyote/http11/Http11AprProcessor.java.orig	2019-03-05 12:13:47.032344988 -0500
++++ java/org/apache/coyote/http11/Http11AprProcessor.java	2019-03-05 14:58:20.298295897 -0500
+@@ -35,6 +35,7 @@ import org.apache.tomcat.jni.SSLSocket;
+ import org.apache.tomcat.jni.Sockaddr;
+ import org.apache.tomcat.jni.Socket;
+ import org.apache.tomcat.util.ExceptionUtils;
++import org.apache.tomcat.util.http.parser.HttpParser;
+ import org.apache.tomcat.util.net.AbstractEndpoint.Handler.SocketState;
+ import org.apache.tomcat.util.net.AprEndpoint;
+ import org.apache.tomcat.util.net.SSLSupport;
+@@ -61,11 +62,15 @@ public class Http11AprProcessor extends
+ 
+ 
+     public Http11AprProcessor(int headerBufferSize, AprEndpoint endpoint, int maxTrailerSize,
+-            Set<String> allowedTrailerHeaders, int maxExtensionSize, int maxSwallowSize) {
++            Set<String> allowedTrailerHeaders,
++            int maxExtensionSize, int maxSwallowSize, String relaxedPathChars,
++            String relaxedQueryChars) {
+ 
+         super(endpoint);
+ 
+-        inputBuffer = new InternalAprInputBuffer(request, headerBufferSize);
++        httpParser = new HttpParser(relaxedPathChars, relaxedQueryChars);
++
++        inputBuffer = new InternalAprInputBuffer(request, headerBufferSize, httpParser);
+         request.setInputBuffer(inputBuffer);
+ 
+         outputBuffer = new InternalAprOutputBuffer(response, headerBufferSize);
+diff -up java/org/apache/coyote/http11/Http11AprProtocol.java.orig java/org/apache/coyote/http11/Http11AprProtocol.java
+--- java/org/apache/coyote/http11/Http11AprProtocol.java.orig	2019-03-05 12:14:08.097279988 -0500
++++ java/org/apache/coyote/http11/Http11AprProtocol.java	2019-03-05 13:59:45.131631454 -0500
+@@ -301,7 +301,9 @@ public class Http11AprProtocol extends A
+             Http11AprProcessor processor = new Http11AprProcessor(
+                     proto.getMaxHttpHeaderSize(), (AprEndpoint)proto.endpoint,
+                     proto.getMaxTrailerSize(), proto.getAllowedTrailerHeadersAsSet(),
+-                    proto.getMaxExtensionSize(), proto.getMaxSwallowSize());
++                    proto.getMaxExtensionSize(),
++                    proto.getMaxSwallowSize(), proto.getRelaxedPathChars(),
++                    proto.getRelaxedQueryChars());
+             processor.setAdapter(proto.adapter);
+             processor.setMaxKeepAliveRequests(proto.getMaxKeepAliveRequests());
+             processor.setKeepAliveTimeout(proto.getKeepAliveTimeout());
+diff -up java/org/apache/coyote/http11/Http11NioProcessor.java.orig java/org/apache/coyote/http11/Http11NioProcessor.java
+--- java/org/apache/coyote/http11/Http11NioProcessor.java.orig	2019-03-05 12:13:47.033344985 -0500
++++ java/org/apache/coyote/http11/Http11NioProcessor.java	2019-03-05 13:04:00.335042387 -0500
+@@ -31,6 +31,7 @@ import org.apache.coyote.http11.filters.
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
+ import org.apache.tomcat.util.ExceptionUtils;
++import org.apache.tomcat.util.http.parser.HttpParser;
+ import org.apache.tomcat.util.net.AbstractEndpoint.Handler.SocketState;
+ import org.apache.tomcat.util.net.NioChannel;
+ import org.apache.tomcat.util.net.NioEndpoint;
+@@ -66,11 +67,15 @@ public class Http11NioProcessor extends
+ 
+ 
+     public Http11NioProcessor(int maxHttpHeaderSize, NioEndpoint endpoint, int maxTrailerSize,
+-            Set<String> allowedTrailerHeaders, int maxExtensionSize, int maxSwallowSize) {
++            Set<String> allowedTrailerHeaders,
++            int maxExtensionSize, int maxSwallowSize, String relaxedPathChars,
++            String relaxedQueryChars) {
+ 
+         super(endpoint);
+ 
+-        inputBuffer = new InternalNioInputBuffer(request, maxHttpHeaderSize);
++        httpParser = new HttpParser(relaxedPathChars, relaxedQueryChars);
++
++        inputBuffer = new InternalNioInputBuffer(request, maxHttpHeaderSize, httpParser);
+         request.setInputBuffer(inputBuffer);
+ 
+         outputBuffer = new InternalNioOutputBuffer(response, maxHttpHeaderSize);
+diff -up java/org/apache/coyote/http11/Http11NioProtocol.java.orig java/org/apache/coyote/http11/Http11NioProtocol.java
+--- java/org/apache/coyote/http11/Http11NioProtocol.java.orig	2019-03-05 12:14:08.098279985 -0500
++++ java/org/apache/coyote/http11/Http11NioProtocol.java	2019-03-05 14:00:15.034537932 -0500
+@@ -266,7 +266,9 @@ public class Http11NioProtocol extends A
+             Http11NioProcessor processor = new Http11NioProcessor(
+                     proto.getMaxHttpHeaderSize(), (NioEndpoint)proto.endpoint,
+                     proto.getMaxTrailerSize(), proto.getAllowedTrailerHeadersAsSet(),
+-                    proto.getMaxExtensionSize(), proto.getMaxSwallowSize());
++                    proto.getMaxExtensionSize(),
++                    proto.getMaxSwallowSize(), proto.getRelaxedPathChars(),
++                    proto.getRelaxedQueryChars());
+             processor.setAdapter(proto.adapter);
+             processor.setMaxKeepAliveRequests(proto.getMaxKeepAliveRequests());
+             processor.setKeepAliveTimeout(proto.getKeepAliveTimeout());
+diff -up java/org/apache/coyote/http11/Http11Processor.java.orig java/org/apache/coyote/http11/Http11Processor.java
+--- java/org/apache/coyote/http11/Http11Processor.java.orig	2017-03-09 08:51:40.000000000 -0500
++++ java/org/apache/coyote/http11/Http11Processor.java	2019-03-05 14:58:20.306295875 -0500
+@@ -26,6 +26,7 @@ import org.apache.coyote.ActionCode;
+ import org.apache.coyote.http11.filters.BufferedInputFilter;
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
++import org.apache.tomcat.util.http.parser.HttpParser;
+ import org.apache.tomcat.util.net.AbstractEndpoint.Handler.SocketState;
+ import org.apache.tomcat.util.net.JIoEndpoint;
+ import org.apache.tomcat.util.net.SSLSupport;
+@@ -51,11 +52,16 @@ public class Http11Processor extends Abs
+ 
+ 
+     public Http11Processor(int headerBufferSize, JIoEndpoint endpoint, int maxTrailerSize,
+-            Set<String> allowedTrailerHeaders, int maxExtensionSize, int maxSwallowSize) {
++            Set<String> allowedTrailerHeaders,
++            int maxExtensionSize, int maxSwallowSize, String relaxedPathChars,
++            String relaxedQueryChars) {
+ 
+         super(endpoint);
++
++        httpParser = new HttpParser(relaxedPathChars, relaxedQueryChars);
++
++        inputBuffer = new InternalInputBuffer(request, headerBufferSize, httpParser);
+         
+-        inputBuffer = new InternalInputBuffer(request, headerBufferSize);
+         request.setInputBuffer(inputBuffer);
+ 
+         outputBuffer = new InternalOutputBuffer(response, headerBufferSize);
+diff -up java/org/apache/coyote/http11/Http11Protocol.java.orig java/org/apache/coyote/http11/Http11Protocol.java
+--- java/org/apache/coyote/http11/Http11Protocol.java.orig	2019-03-05 12:14:08.099279982 -0500
++++ java/org/apache/coyote/http11/Http11Protocol.java	2019-03-05 13:02:36.769301263 -0500
+@@ -165,7 +165,9 @@ public class Http11Protocol extends Abst
+             Http11Processor processor = new Http11Processor(
+                     proto.getMaxHttpHeaderSize(), (JIoEndpoint)proto.endpoint,
+                     proto.getMaxTrailerSize(), proto.getAllowedTrailerHeadersAsSet(),
+-                    proto.getMaxExtensionSize(), proto.getMaxSwallowSize());
++                    proto.getMaxExtensionSize(),
++                    proto.getMaxSwallowSize(), proto.getRelaxedPathChars(),
++                    proto.getRelaxedQueryChars());
+             processor.setAdapter(proto.adapter);
+             processor.setMaxKeepAliveRequests(proto.getMaxKeepAliveRequests());
+             processor.setKeepAliveTimeout(proto.getKeepAliveTimeout());
+diff -up java/org/apache/coyote/http11/InternalAprInputBuffer.java.orig java/org/apache/coyote/http11/InternalAprInputBuffer.java
+--- java/org/apache/coyote/http11/InternalAprInputBuffer.java.orig	2017-03-09 08:51:40.000000000 -0500
++++ java/org/apache/coyote/http11/InternalAprInputBuffer.java	2019-03-05 14:58:20.312295859 -0500
+@@ -51,7 +51,8 @@ public class InternalAprInputBuffer exte
+     /**
+      * Alternate constructor.
+      */
+-    public InternalAprInputBuffer(Request request, int headerBufferSize) {
++    public InternalAprInputBuffer(Request request, int headerBufferSize,
++            HttpParser httpParser) {
+ 
+         this.request = request;
+         headers = request.getMimeHeaders();
+@@ -63,6 +64,8 @@ public class InternalAprInputBuffer exte
+             bbuf = ByteBuffer.allocateDirect((headerBufferSize / 1500 + 1) * 1500);
+         }
+ 
++        this.httpParser = httpParser;
++
+         inputStreamInputBuffer = new SocketInputBuffer();
+ 
+         filterLibrary = new InputFilter[0];
+@@ -231,7 +234,13 @@ public class InternalAprInputBuffer exte
+                 end = pos;
+             } else if ((buf[pos] == Constants.QUESTION) && (questionPos == -1)) {
+                 questionPos = pos;
+-            } else if (HttpParser.isNotRequestTarget(buf[pos])) {
++            } else if (questionPos != -1 && !httpParser.isQueryRelaxed(buf[pos])) {
++                // %nn decoding will be checked at the point of decoding
++                throw new IllegalArgumentException(sm.getString("iib.invalidRequestTarget"));
++            } else if (httpParser.isNotRequestTargetRelaxed(buf[pos])) {
++                // This is a general check that aims to catch problems early
++                // Detailed checking of each part of the request target will
++                // happen in AbstractHttp11Processor#prepareRequest()
+                 throw new IllegalArgumentException(sm.getString("iib.invalidRequestTarget"));
+             }
+ 
+diff -up java/org/apache/coyote/http11/InternalInputBuffer.java.orig java/org/apache/coyote/http11/InternalInputBuffer.java
+--- java/org/apache/coyote/http11/InternalInputBuffer.java.orig	2017-03-09 08:51:40.000000000 -0500
++++ java/org/apache/coyote/http11/InternalInputBuffer.java	2019-03-05 14:58:21.215293426 -0500
+@@ -52,13 +52,16 @@ public class InternalInputBuffer extends
+     /**
+      * Default constructor.
+      */
+-    public InternalInputBuffer(Request request, int headerBufferSize) {
++    public InternalInputBuffer(Request request, int headerBufferSize,
++            HttpParser httpParser) {
+ 
+         this.request = request;
+         headers = request.getMimeHeaders();
+ 
+         buf = new byte[headerBufferSize];
+ 
++        this.httpParser = httpParser;
++
+         inputStreamInputBuffer = new InputStreamInputBuffer();
+ 
+         filterLibrary = new InputFilter[0];
+@@ -185,7 +188,13 @@ public class InternalInputBuffer extends
+                 end = pos;
+             } else if ((buf[pos] == Constants.QUESTION) && (questionPos == -1)) {
+                 questionPos = pos;
+-            } else if (HttpParser.isNotRequestTarget(buf[pos])) {
++            } else if (questionPos != -1 && !httpParser.isQueryRelaxed(buf[pos])) {
++                // %nn decoding will be checked at the point of decoding
++                throw new IllegalArgumentException(sm.getString("iib.invalidRequestTarget"));
++            } else if (httpParser.isNotRequestTargetRelaxed(buf[pos])) {
++                // This is a general check that aims to catch problems early
++                // Detailed checking of each part of the request target will
++                // happen in AbstractHttp11Processor#prepareRequest()
+                 throw new IllegalArgumentException(sm.getString("iib.invalidRequestTarget"));
+             }
+ 
+diff -up java/org/apache/coyote/http11/InternalNioInputBuffer.java.orig java/org/apache/coyote/http11/InternalNioInputBuffer.java
+--- java/org/apache/coyote/http11/InternalNioInputBuffer.java.orig	2017-03-09 08:51:40.000000000 -0500
++++ java/org/apache/coyote/http11/InternalNioInputBuffer.java	2019-03-05 14:58:20.272295967 -0500
+@@ -98,12 +98,14 @@ public class InternalNioInputBuffer exte
+     /**
+      * Alternate constructor.
+      */
+-    public InternalNioInputBuffer(Request request, int headerBufferSize) {
++    public InternalNioInputBuffer(Request request, int headerBufferSize,
++            HttpParser httpParser) {
+ 
+         this.request = request;
+         headers = request.getMimeHeaders();
+ 
+         this.headerBufferSize = headerBufferSize;
++        this.httpParser = httpParser;
+ 
+         inputStreamInputBuffer = new SocketInputBuffer();
+ 
+@@ -313,7 +315,13 @@ public class InternalNioInputBuffer exte
+                     end = pos;
+                 } else if ((buf[pos] == Constants.QUESTION) && (parsingRequestLineQPos == -1)) {
+                     parsingRequestLineQPos = pos;
+-                } else if (HttpParser.isNotRequestTarget(buf[pos])) {
++                } else if (parsingRequestLineQPos != -1 && !httpParser.isQueryRelaxed(buf[pos])) {
++                    // %nn decoding will be checked at the point of decoding
++                    throw new IllegalArgumentException(sm.getString("iib.invalidRequestTarget"));
++                } else if (httpParser.isNotRequestTargetRelaxed(buf[pos])) {
++                    // This is a general check that aims to catch problems early
++                    // Detailed checking of each part of the request target will
++                    // happen in AbstractHttp11Processor#prepareRequest()
+                     throw new IllegalArgumentException(sm.getString("iib.invalidRequestTarget"));
+                 }
+                 pos++;
+diff -up java/org/apache/coyote/http11/LocalStrings.properties.orig java/org/apache/coyote/http11/LocalStrings.properties
+--- java/org/apache/coyote/http11/LocalStrings.properties.orig	2019-03-05 12:14:08.092280004 -0500
++++ java/org/apache/coyote/http11/LocalStrings.properties	2019-03-05 12:23:45.474498387 -0500
+@@ -27,6 +27,9 @@ http11processor.filter.unknown=Unknown f
+ http11processor.filter.error=Error intializing filter {0}
+ http11processor.header.parse=Error parsing HTTP request header
+ http11processor.neverused=This method should never be used
++http11processor.request.invalidScheme=The HTTP request contained an absolute URI with an invalid scheme
++http11processor.request.invalidUri==The HTTP request contained an invalid URI
++http11processor.request.invalidUserInfo=The HTTP request contained an absolute URI with an invalid userinfo
+ http11processor.request.prepare=Error preparing request
+ http11processor.request.process=Error processing request
+ http11processor.request.finish=Error finishing request
+diff -up java/org/apache/tomcat/util/buf/ByteChunk.java.orig java/org/apache/tomcat/util/buf/ByteChunk.java
+--- java/org/apache/tomcat/util/buf/ByteChunk.java.orig	2017-03-09 08:51:41.000000000 -0500
++++ java/org/apache/tomcat/util/buf/ByteChunk.java	2019-03-05 12:16:53.404769901 -0500
+@@ -668,7 +668,8 @@ public final class ByteChunk implements
+     }
+ 
+     /**
+-     * Returns true if the message bytes starts with the specified string.
++     * Returns true if the buffer starts with the specified string when tested
++     * in a case sensitive manner.
+      * @param s the string
+      * @deprecated Unused. Will be removed in Tomcat 8.0.x onwards.
+      */
+@@ -717,6 +718,31 @@ public final class ByteChunk implements
+      * @param s the string
+      * @param pos The position
+      */
++    public boolean startsWith(String s, int pos) {
++        byte[] b = buff;
++        int len = s.length();
++        if (b == null || len + pos > end - start) {
++            return false;
++        }
++        int off = start + pos;
++        for (int i = 0; i < len; i++) {
++            if (b[off++] != s.charAt(i)) {
++                return false;
++            }
++        }
++        return true;
++    }
++
++
++    /**
++     * Returns true if the buffer starts with the specified string when tested
++     * in a case insensitive manner.
++     *
++     * @param s the string
++     * @param pos The position
++     *
++     * @return <code>true</code> if the start matches
++     */
+     public boolean startsWithIgnoreCase(String s, int pos) {
+         byte[] b = buff;
+         int len = s.length();
+diff -up java/org/apache/tomcat/util/http/parser/HttpParser.java.orig java/org/apache/tomcat/util/http/parser/HttpParser.java
+--- java/org/apache/tomcat/util/http/parser/HttpParser.java.orig	2017-03-09 08:51:41.000000000 -0500
++++ java/org/apache/tomcat/util/http/parser/HttpParser.java	2019-03-05 14:58:20.291295916 -0500
+@@ -67,9 +67,17 @@ public class HttpParser {
+     private static final boolean[] IS_SEPARATOR = new boolean[ARRAY_SIZE];
+     private static final boolean[] IS_TOKEN = new boolean[ARRAY_SIZE];
+     private static final boolean[] IS_HEX = new boolean[ARRAY_SIZE];
+-    private static final boolean[] IS_NOT_REQUEST_TARGET = new boolean[ARRAY_SIZE];
+     private static final boolean[] IS_HTTP_PROTOCOL = new boolean[ARRAY_SIZE];
++    private static final boolean[] IS_ALPHA = new boolean[ARRAY_SIZE];
++    private static final boolean[] IS_NUMERIC = new boolean[ARRAY_SIZE];
+     private static final boolean[] REQUEST_TARGET_ALLOW = new boolean[ARRAY_SIZE];
++    private static final boolean[] IS_UNRESERVED = new boolean[ARRAY_SIZE];
++    private static final boolean[] IS_SUBDELIM = new boolean[ARRAY_SIZE];
++    private static final boolean[] IS_USERINFO = new boolean[ARRAY_SIZE];
++    private static final boolean[] IS_RELAXABLE = new boolean[ARRAY_SIZE];
++
++    private static final HttpParser DEFAULT;
++
+ 
+     static {
+         // Digest field types.
+@@ -91,19 +99,6 @@ public class HttpParser {
+         // RFC2617 says nc is 8LHEX. <">8LHEX<"> will also be accepted
+         fieldTypes.put("nc", FIELD_TYPE_LHEX);
+ 
+-        String prop = System.getProperty("tomcat.util.http.parser.HttpParser.requestTargetAllow");
+-        if (prop != null) {
+-            for (int i = 0; i < prop.length(); i++) {
+-                char c = prop.charAt(i);
+-                if (c == '{' || c == '}' || c == '|') {
+-                    REQUEST_TARGET_ALLOW[c] = true;
+-                } else {
+-                    log.warn(sm.getString("httpparser.invalidRequestTargetCharacter",
+-                            Character.valueOf(c)));
+-                }
+-            }
+-        }
+-
+         for (int i = 0; i < ARRAY_SIZE; i++) {
+             // Control> 0-31, 127
+             if (i < 32 || i == 127) {
+@@ -128,6 +123,67 @@ public class HttpParser {
+                 IS_HEX[i] = true;
+             }
+ 
++            // Not valid for HTTP protocol
++            // "HTTP/" DIGIT "." DIGIT
++            if (i == 'H' || i == 'T' || i == 'P' || i == '/' || i == '.' || (i >= '0' && i <= '9')) {
++                IS_HTTP_PROTOCOL[i] = true;
++            }
++
++            if (i >= '0' && i <= '9') {
++                IS_NUMERIC[i] = true;
++            }
++
++            if (i >= 'a' && i <= 'z' || i >= 'A' && i <= 'Z') {
++                IS_ALPHA[i] = true;
++            }
++
++            if (IS_ALPHA[i] || IS_NUMERIC[i] || i == '-' || i == '.' || i == '_' || i == '~') {
++                IS_UNRESERVED[i] = true;
++            }
++
++            if (i == '!' || i == '$' || i == '&' || i == '\'' || i == '(' || i == ')' || i == '*' ||
++                    i == '+' || i == ',' || i == ';' || i == '=') {
++                IS_SUBDELIM[i] = true;
++            }
++
++            // userinfo    = *( unreserved / pct-encoded / sub-delims / ":" )
++            if (IS_UNRESERVED[i] || i == '%' || IS_SUBDELIM[i] || i == ':') {
++                IS_USERINFO[i] = true;
++            }
++
++            // The characters that are normally not permitted for which the
++            // restrictions may be relaxed when used in the path and/or query
++            // string
++            if (i == '\"' || i == '<' || i == '>' || i == '[' || i == '\\' || i == ']' ||
++                    i == '^' || i == '`'  || i == '{' || i == '|' || i == '}') {
++                IS_RELAXABLE[i] = true;
++            }
++        }
++
++        String prop = System.getProperty("tomcat.util.http.parser.HttpParser.requestTargetAllow");
++        if (prop != null) {
++            for (int i = 0; i < prop.length(); i++) {
++                char c = prop.charAt(i);
++                if (c == '{' || c == '}' || c == '|') {
++                    REQUEST_TARGET_ALLOW[c] = true;
++                } else {
++                    log.warn(sm.getString("http.invalidRequestTargetCharacter",
++                            Character.valueOf(c)));
++                }
++            }
++        }
++
++        DEFAULT = new HttpParser(null, null);
++    }
++
++
++    private final boolean[] IS_NOT_REQUEST_TARGET = new boolean[ARRAY_SIZE];
++    private final boolean[] IS_ABSOLUTEPATH_RELAXED = new boolean[ARRAY_SIZE];
++    private final boolean[] IS_QUERY_RELAXED = new boolean[ARRAY_SIZE];
++
++
++    public HttpParser(String relaxedPathChars, String relaxedQueryChars) {
++        for (int i = 0; i < ARRAY_SIZE; i++) {
+             // Not valid for request target.
+             // Combination of multiple rules from RFC7230 and RFC 3986. Must be
+             // ASCII, no controls plus a few additional characters excluded
+@@ -139,12 +195,29 @@ public class HttpParser {
+                 }
+             }
+ 
+-            // Not valid for HTTP protocol
+-            // "HTTP/" DIGIT "." DIGIT
+-            if (i == 'H' || i == 'T' || i == 'P' || i == '/' || i == '.' || (i >= '0' && i <= '9')) {
+-                IS_HTTP_PROTOCOL[i] = true;
++            /*
++             * absolute-path  = 1*( "/" segment )
++             * segment        = *pchar
++             * pchar          = unreserved / pct-encoded / sub-delims / ":" / "@"
++             *
++             * Note pchar allows everything userinfo allows plus "@"
++             */
++            if (IS_USERINFO[i] || i == '@' || i == '/' || REQUEST_TARGET_ALLOW[i]) {
++                IS_ABSOLUTEPATH_RELAXED[i] = true;
++            }
++
++            /*
++             * query          = *( pchar / "/" / "?" )
++             *
++             * Note query allows everything absolute-path allows plus "?"
++             */
++            if (IS_ABSOLUTEPATH_RELAXED[i] || i == '?' || REQUEST_TARGET_ALLOW[i]) {
++                IS_QUERY_RELAXED[i] = true;
+             }
+         }
++
++        relax(IS_ABSOLUTEPATH_RELAXED, relaxedPathChars);
++        relax(IS_QUERY_RELAXED, relaxedQueryChars);
+     }
+ 
+     /**
+@@ -277,6 +350,39 @@ public class HttpParser {
+     }
+ 
+ 
++    public boolean isNotRequestTargetRelaxed(int c) {
++        // Fast for valid request target characters, slower for some incorrect
++        // ones
++        try {
++            return IS_NOT_REQUEST_TARGET[c];
++        } catch (ArrayIndexOutOfBoundsException ex) {
++            return true;
++        }
++    }
++
++
++    public boolean isAbsolutePathRelaxed(int c) {
++        // Fast for valid user info characters, slower for some incorrect
++        // ones
++        try {
++            return IS_ABSOLUTEPATH_RELAXED[c];
++        } catch (ArrayIndexOutOfBoundsException ex) {
++            return false;
++        }
++    }
++
++
++    public boolean isQueryRelaxed(int c) {
++        // Fast for valid user info characters, slower for some incorrect
++        // ones
++        try {
++            return IS_QUERY_RELAXED[c];
++        } catch (ArrayIndexOutOfBoundsException ex) {
++            return false;
++        }
++    }
++
++
+     public static String unquote(String input) {
+         if (input == null || input.length() < 2) {
+             return input;
+@@ -329,27 +435,53 @@ public class HttpParser {
+ 
+ 
+     public static boolean isNotRequestTarget(int c) {
+-        // Fast for valid request target characters, slower for some incorrect
++        return DEFAULT.isNotRequestTargetRelaxed(c);
++    }
++
++
++    public static boolean isHttpProtocol(int c) {
++        // Fast for valid HTTP protocol characters, slower for some incorrect
+         // ones
+         try {
+-            return IS_NOT_REQUEST_TARGET[c];
++            return IS_HTTP_PROTOCOL[c];
+         } catch (ArrayIndexOutOfBoundsException ex) {
+-            return true;
++            return false;
+         }
+     }
+ 
+ 
+-    public static boolean isHttpProtocol(int c) {
+-        // Fast for valid HTTP protocol characters, slower for some incorrect
++    public static boolean isUserInfo(int c) {
++        // Fast for valid user info characters, slower for some incorrect
+         // ones
+         try {
+-            return IS_HTTP_PROTOCOL[c];
++            return IS_USERINFO[c];
++        } catch (ArrayIndexOutOfBoundsException ex) {
++            return false;
++        }
++    }
++
++
++    private static boolean isRelaxable(int c) {
++        // Fast for valid user info characters, slower for some incorrect
++        // ones
++        try {
++            return IS_RELAXABLE[c];
+         } catch (ArrayIndexOutOfBoundsException ex) {
+             return false;
+         }
+     }
+ 
+ 
++    public static boolean isAbsolutePath(int c) {
++        return DEFAULT.isAbsolutePathRelaxed(c);
++    }
++
++
++    public static boolean isQuery(int c) {
++        return DEFAULT.isQueryRelaxed(c);
++    }
++
++
+     // Skip any LWS and return the next char
+     private static int skipLws(StringReader input, boolean withReset)
+             throws IOException {
+@@ -579,6 +711,18 @@ public class HttpParser {
+         }
+     }
+ 
++    private void relax(boolean[] flags, String relaxedChars) {
++        if (relaxedChars != null && relaxedChars.length() > 0) {
++            char[] chars = relaxedChars.toCharArray();
++            for (char c : chars) {
++                if (isRelaxable(c)) {
++                    flags[c] = true;
++                    IS_NOT_REQUEST_TARGET[c] = false;
++                }
++            }
++        }
++    }
++
+     private static enum SkipConstantResult {
+         FOUND,
+         NOT_FOUND,
+diff -up conf/catalina.properties.orig conf/catalina.properties
+--- conf/catalina.properties.orig	2019-03-05 12:13:51.934329862 -0500
++++ conf/catalina.properties	2019-03-05 12:14:08.094279997 -0500
+@@ -132,6 +132,9 @@ tomcat.util.buf.StringCache.byte.enabled
+ #tomcat.util.buf.StringCache.trainThreshold=500000
+ #tomcat.util.buf.StringCache.cacheSize=5000
+ 
++# This system property is deprecated. Use the relaxedPathChars relaxedQueryChars
++# attributes of the Connector instead. These attributes permit a wider range of
++# characters to be configured as valid.
+ # Allow for changes to HTTP request validation
+-# WARNING: Using this option will expose the server to CVE-2016-6816
++# WARNING: Using this option may expose the server to CVE-2016-6816
+ #tomcat.util.http.parser.HttpParser.requestTargetAllow=|
+diff -up webapps/docs/changelog.xml.orig webapps/docs/changelog.xml
+--- webapps/docs/changelog.xml.orig	2019-03-05 12:13:47.068344877 -0500
++++ webapps/docs/changelog.xml	2019-03-05 12:14:08.103279970 -0500
+@@ -108,6 +108,12 @@
+         Improve handing of overflow in the UTF-8 decoder with supplementary
+         characters. (markt)
+       </fix>
++      <add>
++        <bug>62273</bug>: Implement configuration options to work-around
++        specification non-compliant user agents (including all the major
++        browsers) that do not correctly %nn encode URI paths and query strings
++        as required by RFC 7230 and RFC 3986. (markt)
++      </add>
+     </changelog>
+   </subsection>
+ </section>
+diff -up webapps/docs/config/http.xml.orig webapps/docs/config/http.xml
+--- webapps/docs/config/http.xml.orig	2017-03-09 08:51:43.000000000 -0500
++++ webapps/docs/config/http.xml	2019-03-05 12:14:08.103279970 -0500
+@@ -516,6 +516,32 @@
+       expected concurrent requests (synchronous and asynchronous).</p>
+     </attribute>
+ 
++    <attribute name="relaxedPathChars" required="false">
++      <p>The <a href="https://tools.ietf.org/rfc/rfc7230.txt">HTTP/1.1
++      specification</a> requires that certain characters are %nn encoded when
++      used in URI paths. Unfortunately, many user agents including all the major
++      browsers are not compliant with this specification and use these
++      characters in unencoded form. To prevent Tomcat rejecting such requests,
++      this attribute may be used to specify the additional characters to allow.
++      If not specified, no addtional characters will be allowed. The value may
++      be any combination of the following characters:
++      <code>&quot; &lt; &gt; [ \ ] ^ ` { | }</code> . Any other characters
++      present in the value will be ignored.</p>
++    </attribute>
++
++    <attribute name="relaxedQueryChars" required="false">
++      <p>The <a href="https://tools.ietf.org/rfc/rfc7230.txt">HTTP/1.1
++      specification</a> requires that certain characters are %nn encoded when
++      used in URI query strings. Unfortunately, many user agents including all
++      the major browsers are not compliant with this specification and use these
++      characters in unencoded form. To prevent Tomcat rejecting such requests,
++      this attribute may be used to specify the additional characters to allow.
++      If not specified, no addtional characters will be allowed. The value may
++      be any combination of the following characters:
++      <code>&quot; &lt; &gt; [ \ ] ^ ` { | }</code> . Any other characters
++      present in the value will be ignored.</p>
++    </attribute>
++
+     <attribute name="restrictedUserAgents" required="false">
+       <p>The value is a regular expression (using <code>java.util.regex</code>)
+       matching the <code>user-agent</code> header of HTTP clients for which
+diff -up webapps/docs/config/systemprops.xml.orig webapps/docs/config/systemprops.xml
+--- webapps/docs/config/systemprops.xml.orig	2019-03-05 12:14:08.104279967 -0500
++++ webapps/docs/config/systemprops.xml	2019-03-05 12:16:02.075928285 -0500
+@@ -709,11 +709,15 @@
+     </property>
+ 
+     <property name="tomcat.util.http.parser.HttpParser.requestTargetAllow">
++      <p><i>This system property is deprecated. Use the
++      <code>relaxedPathChars</code> and <code>relaxedQueryChars</code>
++      attributes of the Connector instead. These attributes permit a wider range
++      of characters to be configured as valid.</i></p>
+       <p>A string comprised of characters the server should allow even when they are not encoded.
+       These characters would normally result in a 400 status.</p>
+       <p>The acceptable characters for this property are: <code>|</code>, <code>{</code>
+       , and <code>}</code></p>
+-      <p><strong>WARNING</strong>: Use of this option will expose the server to CVE-2016-6816.
++      <p><strong>WARNING</strong>: Use of this option may expose the server to CVE-2016-6816.
+       </p>
+       <p>If not specified, the default value of <code>null</code> will be used.</p>
+     </property>
+diff -up test/org/apache/catalina/core/TestApplicationContext.java.orig test/org/apache/catalina/core/TestApplicationContext.java
+--- test/org/apache/catalina/core/TestApplicationContext.java.orig	2019-03-05 12:13:51.981329717 -0500
++++ test/org/apache/catalina/core/TestApplicationContext.java	2019-03-05 12:14:08.094279997 -0500
+@@ -77,7 +77,7 @@ public class TestApplicationContext exte
+ 
+         ByteChunk res = new ByteChunk();
+         int rc = getUrl("http://localhost:" + getPort() +
+-                "/test/bug5nnnn/bug53467].jsp", res, null);
++                "/test/bug5nnnn/bug53467%5D.jsp", res, null);
+ 
+         Assert.assertEquals(HttpServletResponse.SC_OK, rc);
+         Assert.assertTrue(res.toString().contains("<p>OK</p>"));
